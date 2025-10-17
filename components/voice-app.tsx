@@ -1,16 +1,18 @@
 "use client"
 
 import { useState, useEffect, useRef } from "react"
+import { getAudioPrefs } from "@/lib/audio-prefs"
 import { createClient } from "@/lib/supabase/client"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
-import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Users, Hash, LogOut } from "lucide-react"
+import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Users, Hash, LogOut, Headphones } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useRouter } from "next/navigation"
 import type { RealtimeChannel } from "@supabase/supabase-js"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 
 interface Profile {
   id: string
@@ -43,6 +45,7 @@ export function VoiceApp() {
   const [rooms, setRooms] = useState<Room[]>([])
   const [currentRoom, setCurrentRoom] = useState<string | null>(null)
   const [participants, setParticipants] = useState<RoomParticipant[]>([])
+  const [roomCounts, setRoomCounts] = useState<Record<string, number>>({})
   const [isMuted, setIsMuted] = useState(false)
   const [isDeafened, setIsDeafened] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
@@ -50,10 +53,75 @@ export function VoiceApp() {
 
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
+  const countsChannelRef = useRef<RealtimeChannel | null>(null)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const micTestStreamRef = useRef<MediaStream | null>(null)
+  const levelRafRef = useRef<number | null>(null)
+  const speakingStateRef = useRef<boolean>(false)
+  const monitorGainRef = useRef<GainNode | null>(null)
+  const monitorSourceRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const monitorElementRef = useRef<HTMLAudioElement | null>(null)
+
+  const [inputLevel, setInputLevel] = useState(0)
+  const [isTestingMic, setIsTestingMic] = useState(false)
+  const [isSpeakingLocal, setIsSpeakingLocal] = useState(false)
+  const [isMonitoringMic, setIsMonitoringMic] = useState(false)
 
   useEffect(() => {
     loadUserData()
     loadRooms()
+  }, [])
+
+  // Assinatura global para contagens por sala
+  useEffect(() => {
+    const loadRoomCounts = async () => {
+      try {
+        const { data, error } = await supabase.from("room_participants").select("room_id")
+        if (error) throw error
+        const counts: Record<string, number> = {}
+        ;(data || []).forEach((row: any) => {
+          const rid = row.room_id
+          counts[rid] = (counts[rid] || 0) + 1
+        })
+        setRoomCounts(counts)
+      } catch (e) {
+        console.error("[v0] Error loading room counts:", e)
+      }
+    }
+
+    const channel = supabase
+      .channel("room_counts")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "room_participants" },
+        (payload: any) => {
+          const rid = payload?.new?.room_id
+          if (!rid) return
+          setRoomCounts((prev) => ({ ...prev, [rid]: (prev[rid] || 0) + 1 }))
+        },
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "room_participants" },
+        (payload: any) => {
+          const rid = payload?.old?.room_id
+          if (!rid) return
+          setRoomCounts((prev) => {
+            const next = { ...prev }
+            next[rid] = Math.max(0, (next[rid] || 0) - 1)
+            return next
+          })
+        },
+      )
+      .subscribe()
+
+    countsChannelRef.current = channel
+    loadRoomCounts()
+
+    return () => {
+      channel.unsubscribe()
+    }
   }, [])
 
   useEffect(() => {
@@ -172,8 +240,18 @@ export function VoiceApp() {
     if (!currentUser) return
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const prefs = getAudioPrefs()
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: prefs.inputDeviceId ? { exact: prefs.inputDeviceId } : undefined,
+          echoCancellation: prefs.echoCancellation,
+          noiseSuppression: prefs.noiseSuppression,
+          autoGainControl: prefs.autoGainControl,
+        },
+      })
       mediaStreamRef.current = stream
+
+      setupAnalyser(stream, true)
 
       const { error } = await supabase.from("room_participants").insert({
         room_id: roomId,
@@ -204,6 +282,9 @@ export function VoiceApp() {
         mediaStreamRef.current.getTracks().forEach((track) => track.stop())
         mediaStreamRef.current = null
       }
+
+      stopLevelMonitor()
+      stopMonitor()
 
       await supabase.from("room_participants").delete().eq("room_id", currentRoom).eq("user_id", currentUser.id)
 
@@ -256,6 +337,166 @@ export function VoiceApp() {
     }
   }
 
+  const setupAnalyser = (stream: MediaStream, forRoomUpdate: boolean) => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)()
+      audioContextRef.current = ctx
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 1024
+      analyser.smoothingTimeConstant = 0.8
+      source.connect(analyser)
+      analyserRef.current = analyser
+      startLevelMonitor(forRoomUpdate)
+    } catch (err) {
+      console.error("[v0] Error setting up analyser:", err)
+    }
+  }
+
+  const startLevelMonitor = (forRoomUpdate: boolean) => {
+    const measure = async () => {
+      const analyser = analyserRef.current
+      if (!analyser) return
+
+      const data = new Float32Array(analyser.fftSize)
+      analyser.getFloatTimeDomainData(data)
+      let sum = 0
+      for (let i = 0; i < data.length; i++) {
+        const s = data[i]
+        sum += s * s
+      }
+      const rms = Math.sqrt(sum / data.length)
+      const level = Math.min(1, rms * 4)
+      const pct = Math.round(level * 100)
+      setInputLevel(pct)
+
+      const speaking = pct > 15 && !isMuted && !isDeafened
+      setIsSpeakingLocal(speaking)
+
+      if (forRoomUpdate && currentUser && currentRoom && speaking !== speakingStateRef.current) {
+        speakingStateRef.current = speaking
+        try {
+          await supabase
+            .from("room_participants")
+            .update({ is_speaking: speaking })
+            .eq("room_id", currentRoom)
+            .eq("user_id", currentUser.id)
+        } catch (e) {
+          console.error("[v0] Error updating speaking state:", e)
+        }
+      }
+
+      levelRafRef.current = requestAnimationFrame(measure)
+    }
+    if (levelRafRef.current) cancelAnimationFrame(levelRafRef.current)
+    levelRafRef.current = requestAnimationFrame(measure)
+  }
+
+  const stopLevelMonitor = () => {
+    if (levelRafRef.current) {
+      cancelAnimationFrame(levelRafRef.current)
+      levelRafRef.current = null
+    }
+    setInputLevel(0)
+    setIsSpeakingLocal(false)
+    speakingStateRef.current = false
+    if (audioContextRef.current) {
+      try {
+        audioContextRef.current.close()
+      } catch {}
+      audioContextRef.current = null
+    }
+    analyserRef.current = null
+  }
+
+  const startMicTest = async () => {
+    try {
+      const prefs = getAudioPrefs()
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: prefs.inputDeviceId ? { exact: prefs.inputDeviceId } : undefined,
+          echoCancellation: prefs.echoCancellation,
+          noiseSuppression: prefs.noiseSuppression,
+          autoGainControl: prefs.autoGainControl,
+        },
+      })
+      micTestStreamRef.current = stream
+      setIsTestingMic(true)
+      setupAnalyser(stream, false)
+    } catch (err) {
+      console.error("[v0] Error starting mic test:", err)
+      alert("Não foi possível acessar o microfone para teste.")
+    }
+  }
+
+  const stopMicTest = () => {
+    setIsTestingMic(false)
+    if (micTestStreamRef.current) {
+      micTestStreamRef.current.getTracks().forEach((t) => t.stop())
+      micTestStreamRef.current = null
+    }
+    stopLevelMonitor()
+    stopMonitor()
+  }
+
+  const startMonitor = async () => {
+    try {
+      if (isMonitoringMic) return
+      const stream = micTestStreamRef.current || mediaStreamRef.current
+      if (!stream) {
+        alert("Inicie o teste de microfone ou conecte-se a uma sala para ouvir.")
+        return
+      }
+      const ctx = audioContextRef.current || new (window.AudioContext || (window as any).webkitAudioContext)()
+      audioContextRef.current = ctx
+      const source = ctx.createMediaStreamSource(stream)
+      const gain = ctx.createGain()
+      const prefs = getAudioPrefs()
+      gain.gain.value = prefs.monitorVolume ?? 0.25
+      const dest = ctx.createMediaStreamDestination()
+      source.connect(gain)
+      gain.connect(dest)
+      monitorSourceRef.current = source
+      monitorGainRef.current = gain
+      const el = new Audio()
+      ;(el as any).srcObject = dest.stream
+      try {
+        if ((el as any).setSinkId && prefs.outputDeviceId) {
+          await (el as any).setSinkId(prefs.outputDeviceId)
+        }
+      } catch (e) {
+        console.warn("setSinkId não suportado ou falhou:", e)
+      }
+      try { await el.play() } catch (e) { console.error(e) }
+      monitorElementRef.current = el
+      setIsMonitoringMic(true)
+    } catch (err) {
+      console.error("[v0] Error starting monitor:", err)
+      alert("Não foi possível iniciar a monitoração do microfone.")
+    }
+  }
+
+  const stopMonitor = () => {
+    try {
+      setIsMonitoringMic(false)
+      if (monitorGainRef.current) {
+        try { monitorGainRef.current.disconnect() } catch {}
+        monitorGainRef.current = null
+      }
+      if (monitorSourceRef.current) {
+        try { monitorSourceRef.current.disconnect() } catch {}
+        monitorSourceRef.current = null
+      }
+      const el = monitorElementRef.current
+      if (el) {
+        try { el.pause() } catch {}
+        monitorElementRef.current = null
+      }
+    } catch (err) {
+      console.error("[v0] Error stopping monitor:", err)
+    }
+  }
+
   const handleLogout = async () => {
     if (isConnected) {
       await handleDisconnect()
@@ -285,12 +526,31 @@ export function VoiceApp() {
       <div className="flex w-72 flex-col border-r border-slate-800 bg-slate-900/50 backdrop-blur">
         <div className="flex h-14 items-center justify-between border-b border-slate-800 px-4">
           <h2 className="font-semibold text-white">Salas de Voz</h2>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="rounded-full bg-slate-800 text-white hover:bg-indigo-600 gap-2 px-3"
+                  onClick={() => router.push("/settings/audio")}
+                >
+                  <Headphones className="h-4 w-4" />
+                  <span>Áudio</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent className="bg-slate-800 text-white border-slate-700">
+                Configurar dispositivos e voz
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
         </div>
 
         <ScrollArea className="flex-1 p-2">
           <div className="space-y-1">
             {rooms.map((room) => {
-              const roomParticipantCount = participants.filter((p) => p.room_id === room.id).length
+              const roomParticipantCount =
+                currentRoom === room.id ? participants.length : roomCounts[room.id] ?? 0
               return (
                 <button
                   key={room.id}
@@ -305,12 +565,10 @@ export function VoiceApp() {
                   <Hash className="h-4 w-4 text-slate-400" />
                   <div className="flex-1">
                     <div className="font-medium">{room.name}</div>
-                    {currentRoom === room.id && (
-                      <div className="flex items-center gap-1 text-xs text-slate-300">
-                        <Users className="h-3 w-3" />
-                        {roomParticipantCount} {roomParticipantCount === 1 ? "usuário" : "usuários"}
-                      </div>
-                    )}
+                    <div className="flex items-center gap-1 text-xs text-slate-300">
+                      <Users className="h-3 w-3" />
+                      {roomParticipantCount} {roomParticipantCount === 1 ? "usuário" : "usuários"}
+                    </div>
                   </div>
                 </button>
               )
@@ -321,7 +579,7 @@ export function VoiceApp() {
         {/* Controles de Usuário */}
         <div className="border-t border-slate-800 bg-slate-900/80 p-3">
           <div className="mb-3 flex items-center gap-3">
-            <Avatar className="h-8 w-8">
+            <Avatar className={cn("h-8 w-8", isSpeakingLocal && "ring-2 ring-green-500") }>
               <AvatarFallback className="bg-gradient-to-br from-indigo-500 to-purple-600 text-white text-sm">
                 {currentUser.display_name.charAt(0).toUpperCase()}
               </AvatarFallback>
@@ -339,6 +597,29 @@ export function VoiceApp() {
             >
               <LogOut className="h-4 w-4" />
             </Button>
+          </div>
+
+          <div className="mt-2 h-2 w-full rounded bg-slate-800 overflow-hidden">
+            <div
+              style={{ width: `${inputLevel}%` }}
+              className={cn(
+                "h-full transition-[width]",
+                inputLevel > 60 ? "bg-green-500" : inputLevel > 30 ? "bg-yellow-500" : "bg-slate-500",
+              )}
+            />
+          </div>
+
+          <div className="mt-3 flex items-center gap-2">
+            {!isMonitoringMic ? (
+              <Button onClick={startMonitor} variant="secondary" className="bg-slate-800 text-white">
+                Ouvir microfone
+              </Button>
+            ) : (
+              <Button onClick={stopMonitor} variant="secondary" className="bg-slate-800 text-white">
+                Parar monitor
+              </Button>
+            )}
+            <span className="text-xs text-slate-400">Use com cuidado para evitar eco.</span>
           </div>
 
           <div className="flex gap-2">
@@ -402,6 +683,35 @@ export function VoiceApp() {
                 </div>
                 <h2 className="mb-2 text-xl font-semibold text-white text-balance">Selecione uma sala de voz</h2>
                 <p className="text-slate-400 text-pretty">Escolha uma sala na barra lateral para começar a conversar</p>
+
+                <div className="mt-6 flex flex-col items-center gap-3">
+                  <div className="w-64 h-3 rounded bg-slate-800 overflow-hidden">
+                    <div
+                      style={{ width: `${inputLevel}%` }}
+                      className="h-full bg-indigo-500 transition-[width]"
+                    />
+                  </div>
+                  {!isTestingMic ? (
+                    <Button onClick={startMicTest} className="bg-indigo-600 hover:bg-indigo-700 text-white">
+                      Testar microfone
+                    </Button>
+                  ) : (
+                    <Button onClick={stopMicTest} variant="secondary" className="bg-slate-800 text-white">
+                      Parar teste
+                    </Button>
+                  )}
+                  {!isMonitoringMic ? (
+                    <Button onClick={startMonitor} variant="secondary" className="bg-slate-800 text-white">
+                      Ouvir microfone
+                    </Button>
+                  ) : (
+                    <Button onClick={stopMonitor} variant="secondary" className="bg-slate-800 text-white">
+                      Parar monitor
+                    </Button>
+                  )}
+                  <p className="text-xs text-slate-400">Fale algo e veja a barra mover.</p>
+                  <p className="text-xs text-slate-500">Ative “Ouvir microfone” para monitorar a qualidade.</p>
+                </div>
               </div>
             </div>
           ) : (
