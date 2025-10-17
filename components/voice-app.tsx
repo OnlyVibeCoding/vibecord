@@ -54,6 +54,8 @@ export function VoiceApp() {
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const countsChannelRef = useRef<RealtimeChannel | null>(null)
+  const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>({})
+  const remoteAudioElsRef = useRef<Record<string, HTMLAudioElement>>({})
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const micTestStreamRef = useRef<MediaStream | null>(null)
@@ -125,10 +127,13 @@ export function VoiceApp() {
   }, [])
 
   useEffect(() => {
-    if (!currentRoom) return
+    if (!currentRoom || !currentUser) return
 
-    const channel = supabase
-      .channel(`room:${currentRoom}`)
+    const channel = supabase.channel(`room:${currentRoom}`, {
+      config: { presence: { key: currentUser.id } },
+    })
+
+    channel
       .on(
         "postgres_changes",
         {
@@ -141,15 +146,155 @@ export function VoiceApp() {
           loadParticipants(currentRoom)
         },
       )
-      .subscribe()
+      .on("presence", { event: "sync" }, () => {
+        // Conectar com todos presentes (mesh simples)
+        const state = channel.presenceState() as Record<string, any[]>
+        const peers: string[] = Object.values(state)
+          .flat()
+          .map((p: any) => p.user_id)
+          .filter((uid: string) => uid && uid !== currentUser.id)
+        peers.forEach((uid) => initiateOffer(uid))
+      })
+      .on("presence", { event: "join" }, (payload: any) => {
+        const presences = (payload?.newPresences || []) as any[]
+        presences.forEach((p) => {
+          const uid = p?.user_id
+          if (uid && uid !== currentUser.id) initiateOffer(uid)
+        })
+      })
+      .on("broadcast", { event: "webrtc-offer" }, async ({ payload }: any) => {
+        if (!payload || payload.toId !== currentUser.id) return
+        const fromId = payload.fromId as string
+        const sdp = payload.sdp
+        const pc = createPeerConnection(fromId)
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+          const answer = await pc.createAnswer()
+          await pc.setLocalDescription(answer)
+          channel.send({
+            type: "broadcast",
+            event: "webrtc-answer",
+            payload: { fromId: currentUser.id, toId: fromId, sdp: answer },
+          })
+        } catch (e) {
+          console.error("[v0] Error handling offer:", e)
+        }
+      })
+      .on("broadcast", { event: "webrtc-answer" }, async ({ payload }: any) => {
+        if (!payload || payload.toId !== currentUser.id) return
+        const fromId = payload.fromId as string
+        const sdp = payload.sdp
+        const pc = peerConnectionsRef.current[fromId]
+        if (!pc) return
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+        } catch (e) {
+          console.error("[v0] Error handling answer:", e)
+        }
+      })
+      .on("broadcast", { event: "webrtc-ice" }, async ({ payload }: any) => {
+        if (!payload || payload.toId !== currentUser.id) return
+        const fromId = payload.fromId as string
+        const candidate = payload.candidate
+        const pc = peerConnectionsRef.current[fromId]
+        if (!pc || !candidate) return
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate))
+        } catch (e) {
+          console.error("[v0] Error adding ICE candidate:", e)
+        }
+      })
+
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        try {
+          await channel.track({ user_id: currentUser.id, display_name: currentUser.display_name })
+        } catch (e) {
+          console.warn("[v0] Presence track failed:", e)
+        }
+        loadParticipants(currentRoom)
+      }
+    })
 
     channelRef.current = channel
-    loadParticipants(currentRoom)
 
     return () => {
       channel.unsubscribe()
+      // Fechar conexões e parar áudios ao sair da sala
+      Object.values(peerConnectionsRef.current).forEach((pc) => {
+        try { pc.close() } catch {}
+      })
+      peerConnectionsRef.current = { }
+      Object.values(remoteAudioElsRef.current).forEach((el) => {
+        try { el.pause() } catch {}
+      })
+      remoteAudioElsRef.current = { }
     }
-  }, [currentRoom])
+  }, [currentRoom, currentUser])
+
+  const createPeerConnection = (peerId: string) => {
+    let pc = peerConnectionsRef.current[peerId]
+    if (pc) return pc
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    })
+
+    const localStream = mediaStreamRef.current
+    if (localStream) {
+      const track = localStream.getAudioTracks()[0]
+      if (track) pc.addTrack(track, localStream)
+    }
+
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return
+      const channel = channelRef.current
+      if (!channel || !currentUser) return
+      channel.send({
+        type: "broadcast",
+        event: "webrtc-ice",
+        payload: { fromId: currentUser.id, toId: peerId, candidate: e.candidate },
+      })
+    }
+
+    pc.ontrack = (evt) => {
+      const stream = evt.streams[0]
+      if (!stream) return
+      let el = remoteAudioElsRef.current[peerId]
+      if (!el) {
+        el = new Audio()
+        el.autoplay = true
+        remoteAudioElsRef.current[peerId] = el
+      }
+      ;(el as any).srcObject = stream
+      const prefs = getAudioPrefs()
+      if ((el as any).setSinkId && prefs.outputDeviceId) {
+        ;(el as any).setSinkId(prefs.outputDeviceId).catch((e: any) =>
+          console.warn("setSinkId remote failed:", e),
+        )
+      }
+      try { el.play() } catch (e) { console.error(e) }
+    }
+
+    peerConnectionsRef.current[peerId] = pc
+    return pc
+  }
+
+  const initiateOffer = async (peerId: string) => {
+    try {
+      if (!currentUser) return
+      const pc = createPeerConnection(peerId)
+      const offer = await pc.createOffer()
+      await pc.setLocalDescription(offer)
+      const channel = channelRef.current
+      channel?.send({
+        type: "broadcast",
+        event: "webrtc-offer",
+        payload: { fromId: currentUser.id, toId: peerId, sdp: offer },
+      })
+    } catch (e) {
+      console.error("[v0] Error initiating offer:", e)
+    }
+  }
 
   const loadUserData = async () => {
     try {
@@ -334,6 +479,17 @@ export function VoiceApp() {
 
     if (newDeafenState) {
       setIsMuted(true)
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = false
+        })
+      }
+    } else {
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getAudioTracks().forEach((track) => {
+          track.enabled = !isMuted
+        })
+      }
     }
   }
 
