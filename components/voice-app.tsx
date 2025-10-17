@@ -8,7 +8,7 @@ import { Card } from "@/components/ui/card"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
-import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Users, Hash, LogOut, Headphones } from "lucide-react"
+import { Mic, MicOff, Volume2, VolumeX, PhoneOff, Users, Hash, LogOut, Headphones, Settings, Menu, X, Zap, Gamepad2 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useRouter } from "next/navigation"
 import type { RealtimeChannel } from "@supabase/supabase-js"
@@ -50,12 +50,14 @@ export function VoiceApp() {
   const [isDeafened, setIsDeafened] = useState(false)
   const [isConnected, setIsConnected] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false)
 
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const channelRef = useRef<RealtimeChannel | null>(null)
   const countsChannelRef = useRef<RealtimeChannel | null>(null)
   const peerConnectionsRef = useRef<Record<string, RTCPeerConnection>>({})
   const remoteAudioElsRef = useRef<Record<string, HTMLAudioElement>>({})
+  const heartbeatRef = useRef<number | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const micTestStreamRef = useRef<MediaStream | null>(null)
@@ -69,6 +71,11 @@ export function VoiceApp() {
   const [isTestingMic, setIsTestingMic] = useState(false)
   const [isSpeakingLocal, setIsSpeakingLocal] = useState(false)
   const [isMonitoringMic, setIsMonitoringMic] = useState(false)
+  const [speakingUsers, setSpeakingUsers] = useState<Set<string>>(new Set())
+  const [audioLevels, setAudioLevels] = useState<Record<string, number>>({})
+  const [lastHeartbeat, setLastHeartbeat] = useState<number>(Date.now())
+  const heartbeatIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const presenceUsersRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     loadUserData()
@@ -153,13 +160,35 @@ export function VoiceApp() {
           .flat()
           .map((p: any) => p.user_id)
           .filter((uid: string) => uid && uid !== currentUser.id)
+        
+        // Atualizar lista de usuários presentes
+        const currentPresenceUsers = new Set(Object.values(state).flat().map((p: any) => p.user_id).filter(Boolean))
+        presenceUsersRef.current = currentPresenceUsers
+        
+        // Remover participantes que não estão mais presentes
+        cleanupDisconnectedUsers(currentRoom, currentPresenceUsers)
+        
         peers.forEach((uid) => initiateOffer(uid))
       })
       .on("presence", { event: "join" }, (payload: any) => {
         const presences = (payload?.newPresences || []) as any[]
         presences.forEach((p) => {
           const uid = p?.user_id
-          if (uid && uid !== currentUser.id) initiateOffer(uid)
+          if (uid && uid !== currentUser.id) {
+            presenceUsersRef.current.add(uid)
+            initiateOffer(uid)
+          }
+        })
+      })
+      .on("presence", { event: "leave" }, (payload: any) => {
+        const presences = (payload?.leftPresences || []) as any[]
+        presences.forEach((p) => {
+          const uid = p?.user_id
+          if (uid) {
+            presenceUsersRef.current.delete(uid)
+            // Remover imediatamente da tabela room_participants
+            removeDisconnectedUser(currentRoom, uid)
+          }
         })
       })
       .on("broadcast", { event: "webrtc-offer" }, async ({ payload }: any) => {
@@ -204,31 +233,46 @@ export function VoiceApp() {
           console.error("[v0] Error adding ICE candidate:", e)
         }
       })
+      .on("broadcast", { event: "heartbeat" }, ({ payload }: any) => {
+        if (payload?.userId && payload.userId !== currentUser.id) {
+          // Atualizar timestamp do heartbeat do usuário
+          setLastHeartbeat(Date.now())
+        }
+      })
 
     channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
         try {
-          await channel.track({ user_id: currentUser.id, display_name: currentUser.display_name })
+          await channel.track({ 
+            user_id: currentUser.id, 
+            display_name: currentUser.display_name,
+            last_seen: Date.now()
+          })
         } catch (e) {
           console.warn("[v0] Presence track failed:", e)
         }
         loadParticipants(currentRoom)
+        startHeartbeat(channel)
       }
     })
 
     channelRef.current = channel
 
     return () => {
+      stopHeartbeat()
       channel.unsubscribe()
       // Fechar conexões e parar áudios ao sair da sala
       Object.values(peerConnectionsRef.current).forEach((pc) => {
         try { pc.close() } catch {}
       })
-      peerConnectionsRef.current = { }
+      peerConnectionsRef.current = {}
       Object.values(remoteAudioElsRef.current).forEach((el) => {
         try { el.pause() } catch {}
       })
-      remoteAudioElsRef.current = { }
+      remoteAudioElsRef.current = {}
+      setAudioLevels({})
+      setAudioLevels({})
+      setSpeakingUsers(new Set())
     }
   }, [currentRoom, currentUser])
 
@@ -653,6 +697,127 @@ export function VoiceApp() {
     }
   }
 
+  // Função para remover usuário desconectado
+  const removeDisconnectedUser = async (roomId: string, userId: string) => {
+    try {
+      const { error } = await supabase
+        .from("room_participants")
+        .delete()
+        .eq("room_id", roomId)
+        .eq("user_id", userId)
+
+      if (error) {
+        console.error("[v0] Error removing disconnected user:", error)
+      } else {
+        console.log(`[v0] Removed disconnected user ${userId} from room ${roomId}`)
+      }
+    } catch (error) {
+      console.error("[v0] Error removing disconnected user:", error)
+    }
+  }
+
+  // Função para limpar usuários desconectados baseado na presença
+  const cleanupDisconnectedUsers = async (roomId: string, presenceUsers: Set<string>) => {
+    try {
+      // Buscar todos os participantes da sala
+      const { data: roomParticipants, error } = await supabase
+        .from("room_participants")
+        .select("user_id")
+        .eq("room_id", roomId)
+
+      if (error) {
+        console.error("[v0] Error fetching room participants:", error)
+        return
+      }
+
+      // Encontrar usuários que estão na tabela mas não estão presentes
+      const disconnectedUsers = roomParticipants?.filter(
+        participant => !presenceUsers.has(participant.user_id)
+      ) || []
+
+      // Remover usuários desconectados
+      for (const user of disconnectedUsers) {
+        await removeDisconnectedUser(roomId, user.user_id)
+      }
+
+      if (disconnectedUsers.length > 0) {
+        console.log(`[v0] Cleaned up ${disconnectedUsers.length} disconnected users`)
+      }
+    } catch (error) {
+      console.error("[v0] Error during cleanup:", error)
+    }
+  }
+
+  // Sistema de heartbeat para detectar conexões perdidas
+  const startHeartbeat = (channel: any) => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current)
+    }
+
+    heartbeatIntervalRef.current = setInterval(() => {
+      if (currentUser && currentRoom) {
+        channel.send({
+          type: "broadcast",
+          event: "heartbeat",
+          payload: { 
+            userId: currentUser.id, 
+            timestamp: Date.now(),
+            roomId: currentRoom
+          }
+        })
+      }
+    }, 30000) // Heartbeat a cada 30 segundos
+  }
+
+  const stopHeartbeat = () => {
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current)
+      heartbeatIntervalRef.current = null
+    }
+  }
+
+  // Cleanup periódico baseado em inatividade
+  useEffect(() => {
+    if (!currentRoom) return
+
+    const cleanupInterval = setInterval(async () => {
+      if (currentRoom && presenceUsersRef.current.size > 0) {
+        await cleanupDisconnectedUsers(currentRoom, presenceUsersRef.current)
+      }
+    }, 60000) // Cleanup a cada 1 minuto
+
+    return () => clearInterval(cleanupInterval)
+  }, [currentRoom])
+
+  // Cleanup ao desmontar o componente
+  useEffect(() => {
+    const handleBeforeUnload = async () => {
+      if (currentUser && currentRoom) {
+        await removeDisconnectedUser(currentRoom, currentUser.id)
+      }
+    }
+
+    const handleVisibilityChange = async () => {
+      if (document.hidden && currentUser && currentRoom) {
+        // Usuário saiu da aba/minimizou - remover após delay
+        setTimeout(async () => {
+          if (document.hidden && currentUser && currentRoom) {
+            await removeDisconnectedUser(currentRoom, currentUser.id)
+          }
+        }, 10000) // 10 segundos de delay
+      }
+    }
+
+    window.addEventListener('beforeunload', handleBeforeUnload)
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      window.removeEventListener('beforeunload', handleBeforeUnload)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+      stopHeartbeat()
+    }
+  }, [currentUser, currentRoom])
+
   const handleLogout = async () => {
     if (isConnected) {
       await handleDisconnect()
@@ -663,10 +828,15 @@ export function VoiceApp() {
 
   if (isLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-950 via-indigo-950 to-slate-900">
+      <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900">
         <div className="text-center">
-          <div className="mb-4 h-12 w-12 animate-spin rounded-full border-4 border-indigo-500 border-t-transparent mx-auto" />
-          <p className="text-slate-400">Carregando...</p>
+          <div className="mb-4 inline-flex h-16 w-16 animate-spin items-center justify-center rounded-full bg-gradient-to-r from-cyan-500 to-purple-500">
+            <Gamepad2 className="h-8 w-8 text-white" />
+          </div>
+          <p className="text-lg font-medium text-white">Carregando GameVoice...</p>
+          <div className="mt-2 h-1 w-48 overflow-hidden rounded-full bg-slate-700">
+            <div className="h-full w-full animate-pulse bg-gradient-to-r from-cyan-500 to-purple-500"></div>
+          </div>
         </div>
       </div>
     )
@@ -677,246 +847,471 @@ export function VoiceApp() {
   }
 
   return (
-    <div className="flex h-screen bg-gradient-to-br from-slate-950 via-indigo-950 to-slate-900">
-      {/* Sidebar - Lista de Salas */}
-      <div className="flex w-72 flex-col border-r border-slate-800 bg-slate-900/50 backdrop-blur">
-        <div className="flex h-14 items-center justify-between border-b border-slate-800 px-4">
-          <h2 className="font-semibold text-white">Salas de Voz</h2>
-          <TooltipProvider>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="rounded-full bg-slate-800 text-white hover:bg-indigo-600 gap-2 px-3"
-                  onClick={() => router.push("/settings/audio")}
-                >
-                  <Headphones className="h-4 w-4" />
-                  <span>Áudio</span>
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent className="bg-slate-800 text-white border-slate-700">
-                Configurar dispositivos e voz
-              </TooltipContent>
-            </Tooltip>
-          </TooltipProvider>
+    <div className="flex h-screen bg-gradient-to-br from-slate-900 via-purple-900/20 to-slate-900 text-white overflow-hidden">
+      {/* Mobile Header */}
+      <div className="fixed top-0 left-0 right-0 z-50 flex items-center justify-between bg-slate-900/95 backdrop-blur-md border-b border-cyan-500/20 p-4 lg:hidden">
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-r from-cyan-500 to-purple-500">
+            <Gamepad2 className="h-5 w-5 text-white" />
+          </div>
+          <h1 className="text-xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">
+            GameVoice
+          </h1>
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+          className="text-cyan-400 hover:bg-cyan-500/10 hover:text-cyan-300 transition-all duration-200"
+        >
+          {isSidebarOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+        </Button>
+      </div>
+
+      {/* Sidebar */}
+      <div className={cn(
+        "fixed inset-y-0 left-0 z-40 w-80 transform bg-slate-900/95 backdrop-blur-xl border-r border-cyan-500/20 transition-transform duration-300 ease-in-out lg:relative lg:translate-x-0 flex flex-col relative",
+        isSidebarOpen ? "translate-x-0" : "-translate-x-full"
+      )}>
+        {/* Sidebar Header */}
+        <div className="flex items-center gap-3 border-b border-cyan-500/20 p-6 bg-gradient-to-r from-slate-900 to-slate-800">
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-purple-500 shadow-lg shadow-cyan-500/25">
+            <Gamepad2 className="h-6 w-6 text-white" />
+          </div>
+          <div>
+            <h1 className="text-xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent">
+              Vibecord
+            </h1>
+            <p className="text-xs text-slate-400">Ultimate Gaming Voice Chat</p>
+          </div>
         </div>
 
-        <ScrollArea className="flex-1 p-2">
-          <div className="space-y-1">
+        {/* Rooms List */}
+        <ScrollArea className="flex-1 p-4 pb-28">
+          <div className="mb-4">
+            <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+              <Zap className="h-4 w-4 text-cyan-400" />
+              Game Rooms
+            </h2>
+          </div>
+          <div className="space-y-2">
             {rooms.map((room) => {
-              const roomParticipantCount =
-                currentRoom === room.id ? participants.length : roomCounts[room.id] ?? 0
+              const roomParticipantCount = currentRoom === room.id ? participants.length : roomCounts[room.id] ?? 0
+              const isCurrentRoom = currentRoom === room.id
               return (
-                <button
+                <div
                   key={room.id}
-                  onClick={() => !isConnected && handleConnectToRoom(room.id)}
-                  disabled={isConnected && currentRoom !== room.id}
                   className={cn(
-                    "flex w-full items-center gap-3 rounded-md px-3 py-2 text-left transition-colors",
-                    currentRoom === room.id ? "bg-indigo-600 text-white" : "text-slate-300 hover:bg-slate-800",
-                    isConnected && currentRoom !== room.id && "opacity-50 cursor-not-allowed",
+                    "group relative overflow-hidden rounded-xl border transition-all duration-200 cursor-pointer",
+                    isCurrentRoom 
+                      ? "bg-gradient-to-r from-cyan-600/20 to-purple-600/20 border-cyan-500/50 shadow-lg shadow-cyan-500/25" 
+                      : "bg-slate-800/50 border-slate-700/50 hover:bg-slate-800/80 hover:border-cyan-500/30 hover:shadow-lg hover:shadow-cyan-500/10"
                   )}
+                  onClick={() => !isConnected && handleConnectToRoom(room.id)}
                 >
-                  <Hash className="h-4 w-4 text-slate-400" />
-                  <div className="flex-1">
-                    <div className="font-medium">{room.name}</div>
-                    <div className="flex items-center gap-1 text-xs text-slate-300">
-                      <Users className="h-3 w-3" />
-                      {roomParticipantCount} {roomParticipantCount === 1 ? "usuário" : "usuários"}
+                  {/* Animated background gradient */}
+                  <div className={cn(
+                    "absolute inset-0 bg-gradient-to-r from-cyan-500/10 to-purple-500/10 opacity-0 transition-opacity duration-200",
+                    isCurrentRoom ? "opacity-100" : "group-hover:opacity-50"
+                  )} />
+                  
+                  <div className="relative p-4">
+                    <div className="flex items-center gap-3">
+                      <div className={cn(
+                        "flex h-10 w-10 items-center justify-center rounded-lg transition-all duration-300",
+                        "group-hover:scale-110 group-hover:rotate-3",
+                        isCurrentRoom
+                          ? "bg-gradient-to-r from-cyan-500 to-purple-500 shadow-lg shadow-cyan-500/25"
+                          : "bg-gradient-to-r from-slate-600 to-slate-500 group-hover:from-cyan-500/80 group-hover:to-purple-500/80"
+                      )}>
+                        <Hash className={cn(
+                          "h-5 w-5 transition-all duration-300",
+                          isCurrentRoom ? "text-white" : "text-slate-200 group-hover:text-white"
+                        )} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className={cn(
+                          "font-semibold truncate transition-all duration-300",
+                          "group-hover:translate-x-1",
+                          isCurrentRoom ? "text-white" : "text-slate-200 group-hover:text-white"
+                        )}>
+                          {room.name}
+                        </div>
+                        <div className="flex items-center gap-2 mt-1">
+                          <div className="flex items-center gap-1">
+                            <Users className={cn(
+                              "h-3 w-3 transition-all duration-300",
+                              isCurrentRoom ? "text-cyan-400" : "text-slate-400 group-hover:text-cyan-400"
+                            )} />
+                            <span className={cn(
+                              "text-xs transition-colors duration-300",
+                              isCurrentRoom ? "text-slate-300" : "text-slate-400 group-hover:text-slate-300"
+                            )}>
+                              {roomParticipantCount} {roomParticipantCount === 1 ? "player" : "players"}
+                            </span>
+                          </div>
+                          {roomParticipantCount > 0 && (
+                            <div className="flex h-2 w-2 rounded-full bg-green-400 animate-pulse" />
+                          )}
+                        </div>
+                        {isConnected && currentRoom !== room.id && (
+                          <div className="text-xs text-slate-500 bg-slate-700/50 px-2 py-1 rounded transition-all duration-300 group-hover:bg-slate-600/50">
+                            Locked
+                          </div>
+                        )}
+                      </div>
                     </div>
                   </div>
-                </button>
+                </div>
               )
             })}
           </div>
         </ScrollArea>
 
-        {/* Controles de Usuário */}
-        <div className="border-t border-slate-800 bg-slate-900/80 p-3">
-          <div className="mb-3 flex items-center gap-3">
-            <Avatar className={cn("h-8 w-8", isSpeakingLocal && "ring-2 ring-green-500") }>
-              <AvatarFallback className="bg-gradient-to-br from-indigo-500 to-purple-600 text-white text-sm">
-                {currentUser.display_name.charAt(0).toUpperCase()}
-              </AvatarFallback>
-            </Avatar>
-            <div className="flex-1 overflow-hidden">
-              <div className="truncate text-sm font-medium text-white">{currentUser.display_name}</div>
-              <div className="text-xs text-slate-400">{isConnected ? "Conectado" : "Desconectado"}</div>
-            </div>
-            <Button
-              size="icon"
-              variant="ghost"
-              className="h-8 w-8 text-slate-400 hover:text-white hover:bg-slate-800"
-              onClick={handleLogout}
-              title="Sair"
-            >
-              <LogOut className="h-4 w-4" />
-            </Button>
-          </div>
-
-          <div className="mt-2 h-2 w-full rounded bg-slate-800 overflow-hidden">
-            <div
-              style={{ width: `${inputLevel}%` }}
-              className={cn(
-                "h-full transition-[width]",
-                inputLevel > 60 ? "bg-green-500" : inputLevel > 30 ? "bg-yellow-500" : "bg-slate-500",
-              )}
-            />
-          </div>
-
-          <div className="mt-3 flex items-center gap-2">
-            {!isMonitoringMic ? (
-              <Button onClick={startMonitor} variant="secondary" className="bg-slate-800 text-white">
-                Ouvir microfone
-              </Button>
-            ) : (
-              <Button onClick={stopMonitor} variant="secondary" className="bg-slate-800 text-white">
-                Parar monitor
-              </Button>
-            )}
-            <span className="text-xs text-slate-400">Use com cuidado para evitar eco.</span>
-          </div>
-
-          <div className="flex gap-2">
-            <Button
-              size="icon"
-              variant={isMuted ? "destructive" : "secondary"}
-              onClick={toggleMute}
-              disabled={!isConnected}
-              className="flex-1 bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-50"
-            >
-              {isMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
-            </Button>
-            <Button
-              size="icon"
-              variant={isDeafened ? "destructive" : "secondary"}
-              onClick={toggleDeafen}
-              disabled={!isConnected}
-              className="flex-1 bg-slate-800 hover:bg-slate-700 text-white disabled:opacity-50"
-            >
-              {isDeafened ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
-            </Button>
-            {isConnected && (
+        {/* User Controls */}
+        <div className="absolute bottom-0 left-0 right-0 border-t border-slate-800 bg-gradient-to-r from-slate-900 to-slate-800 p-4">
+          {currentUser && (
+            <div className="mb-4 flex items-center gap-3">
+              <Avatar className="h-12 w-12 ring-2 ring-cyan-500/50">
+                <AvatarFallback className="bg-gradient-to-br from-cyan-500 to-purple-600 text-white font-semibold">
+                  {currentUser.display_name.charAt(0).toUpperCase()}
+                </AvatarFallback>
+              </Avatar>
+              <div className="flex-1 min-w-0">
+                <div className="font-medium text-white truncate">{currentUser.display_name}</div>
+                <div className="text-xs text-slate-400">
+                  {isConnected ? "In Game" : "Ready to Play"}
+                </div>
+              </div>
               <Button
-                size="icon"
-                variant="destructive"
-                onClick={handleDisconnect}
-                className="flex-1 bg-red-600 hover:bg-red-700"
+                onClick={() => router.push("/settings/audio")}
+                variant="secondary"
+                size="sm"
+                aria-label="Open Settings"
+                className={cn(
+                  "shrink-0 transition-all duration-300 hover:scale-105 active:scale-95",
+                  "hover:shadow-lg",
+                  "bg-slate-700 hover:bg-slate-600 shadow-slate-700/25 hover:shadow-slate-600/40"
+                )}
               >
-                <PhoneOff className="h-4 w-4" />
+                <Settings className="h-4 w-4" />
               </Button>
-            )}
-          </div>
+            </div>
+          )}
+
+          {/* Audio Controls */}
+          {isConnected && (
+            <div className="space-y-3">
+              {/* Input Level Visualizer */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Mic Level</span>
+                  <span>{inputLevel}%</span>
+                </div>
+                <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                  <div 
+                    className={cn(
+                      "h-full transition-all duration-100 rounded-full",
+                      inputLevel > 70 ? "bg-gradient-to-r from-red-500 to-red-400" :
+                      inputLevel > 30 ? "bg-gradient-to-r from-yellow-500 to-orange-400" :
+                      "bg-gradient-to-r from-green-500 to-cyan-400"
+                    )}
+                    style={{ width: `${inputLevel}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Control Buttons */}
+              <div className="flex gap-2">
+                <Button
+                  onClick={toggleMute}
+                  variant={isMuted ? "destructive" : "secondary"}
+                  size="sm"
+                  className={cn(
+                    "transition-all duration-300 hover:scale-105 active:scale-95",
+                    "hover:shadow-lg",
+                    isMuted 
+                      ? "bg-red-600 hover:bg-red-500 shadow-red-500/25 hover:shadow-red-500/40" 
+                      : "bg-slate-700 hover:bg-slate-600 shadow-slate-700/25 hover:shadow-slate-600/40"
+                  )}
+                >
+                  {isMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                </Button>
+                <Button
+                  onClick={toggleDeafen}
+                  variant={isDeafened ? "destructive" : "secondary"}
+                  size="sm"
+                  className={cn(
+                    "transition-all duration-300 hover:scale-105 active:scale-95",
+                    "hover:shadow-lg",
+                    isDeafened 
+                      ? "bg-red-600 hover:bg-red-500 shadow-red-500/25 hover:shadow-red-500/40" 
+                      : "bg-slate-700 hover:bg-slate-600 shadow-slate-700/25 hover:shadow-slate-600/40"
+                  )}
+                >
+                  {isDeafened ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                </Button>
+                <Button
+                  onClick={() => router.push("/settings/audio")}
+                  variant="secondary"
+                  size="sm"
+                  aria-label="Audio Settings"
+                  className={cn(
+                    "transition-all duration-300 hover:scale-105 active:scale-95",
+                    "hover:shadow-lg",
+                    "bg-slate-700 hover:bg-slate-600 shadow-slate-700/25 hover:shadow-slate-600/40"
+                  )}
+                >
+                  <Settings className="h-4 w-4" />
+                </Button>
+              </div>
+
+              <Button
+                onClick={handleDisconnect}
+                variant="destructive"
+                size="sm"
+                className="w-full transition-all duration-300 hover:scale-105 active:scale-95 hover:shadow-lg hover:shadow-red-500/40 bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-red-400"
+              >
+                <PhoneOff className="mr-2 h-4 w-4" />
+                Leave Game
+              </Button>
+            </div>
+          )}
+
+          {/* Mic Testing Controls for Non-Connected State */}
+          {!isConnected && (
+            <div className="space-y-3">
+              {/* Input Level Visualizer */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span>Mic Level</span>
+                  <span>{inputLevel}%</span>
+                </div>
+                <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                  <div 
+                    className={cn(
+                      "h-full transition-all duration-100 rounded-full",
+                      inputLevel > 70 ? "bg-gradient-to-r from-red-500 to-red-400" :
+                      inputLevel > 30 ? "bg-gradient-to-r from-yellow-500 to-orange-400" :
+                      "bg-gradient-to-r from-green-500 to-cyan-400"
+                    )}
+                    style={{ width: `${inputLevel}%` }}
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+
+
+
         </div>
       </div>
 
-      {/* Área Principal */}
+      {/* Mobile Overlay */}
+      {isSidebarOpen && (
+        <div 
+          className="fixed inset-0 z-30 bg-black/50 backdrop-blur-sm lg:hidden"
+          onClick={() => setIsSidebarOpen(false)}
+        />
+      )}
+
+      {/* Main Area */}
       <div className="flex flex-1 flex-col">
-        {/* Header */}
-        <div className="flex h-14 items-center justify-between border-b border-slate-800 px-6 bg-slate-900/30 backdrop-blur">
-          <div className="flex items-center gap-2">
-            <Hash className="h-5 w-5 text-slate-400" />
-            <h1 className="text-lg font-semibold text-white">
-              {currentRoom ? rooms.find((r) => r.id === currentRoom)?.name : "Selecione uma sala"}
-            </h1>
-          </div>
-          {isConnected && (
-            <Badge className="gap-1 bg-green-500/20 text-green-400 border-green-500/30">
-              <div className="h-2 w-2 animate-pulse rounded-full bg-green-500" />
-              Conectado
-            </Badge>
-          )}
-        </div>
-
-        {/* Lista de Participantes */}
-        <div className="flex-1 p-6 overflow-auto">
-          {!isConnected ? (
-            <div className="flex h-full items-center justify-center">
-              <div className="text-center">
-                <div className="mx-auto mb-4 flex h-20 w-20 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-purple-600">
-                  <Volume2 className="h-10 w-10 text-white" />
-                </div>
-                <h2 className="mb-2 text-xl font-semibold text-white text-balance">Selecione uma sala de voz</h2>
-                <p className="text-slate-400 text-pretty">Escolha uma sala na barra lateral para começar a conversar</p>
-
-                <div className="mt-6 flex flex-col items-center gap-3">
-                  <div className="w-64 h-3 rounded bg-slate-800 overflow-hidden">
-                    <div
-                      style={{ width: `${inputLevel}%` }}
-                      className="h-full bg-indigo-500 transition-[width]"
-                    />
+        {/* Room Content */}
+        <div className="flex-1 p-4 lg:p-6">
+          {currentRoom ? (
+            <div className="h-full">
+              {/* Room Header */}
+              <div className="mb-6">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-r from-cyan-500 to-purple-500 shadow-lg shadow-cyan-500/25">
+                    <Hash className="h-6 w-6 text-white" />
                   </div>
-                  {!isTestingMic ? (
-                    <Button onClick={startMicTest} className="bg-indigo-600 hover:bg-indigo-700 text-white">
-                      Testar microfone
-                    </Button>
-                  ) : (
-                    <Button onClick={stopMicTest} variant="secondary" className="bg-slate-800 text-white">
-                      Parar teste
-                    </Button>
-                  )}
-                  {!isMonitoringMic ? (
-                    <Button onClick={startMonitor} variant="secondary" className="bg-slate-800 text-white">
-                      Ouvir microfone
-                    </Button>
-                  ) : (
-                    <Button onClick={stopMonitor} variant="secondary" className="bg-slate-800 text-white">
-                      Parar monitor
-                    </Button>
-                  )}
-                  <p className="text-xs text-slate-400">Fale algo e veja a barra mover.</p>
-                  <p className="text-xs text-slate-500">Ative “Ouvir microfone” para monitorar a qualidade.</p>
+                  <div>
+                    <h2 className="text-2xl font-bold text-white">
+                      {rooms.find(r => r.id === currentRoom)?.name || "Unknown Room"}
+                    </h2>
+                    <div className="flex items-center gap-2 text-slate-400">
+                      <Users className="h-4 w-4" />
+                      <span>{participants.length} {participants.length === 1 ? "player" : "players"} connected</span>
+                      {isConnected && (
+                        <>
+                          <div className="h-1 w-1 rounded-full bg-slate-600" />
+                          <div className="flex items-center gap-1">
+                            <div className="h-2 w-2 rounded-full bg-green-400 animate-pulse" />
+                            <span className="text-green-400">Live</span>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
-            </div>
-          ) : (
-            <div>
-              <div className="mb-4 flex items-center gap-2">
-                <Users className="h-5 w-5 text-slate-400" />
-                <h2 className="font-semibold text-white">Participantes — {participants.length}</h2>
-              </div>
 
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                {participants.map((participant) => (
-                  <Card
-                    key={participant.user_id}
-                    className={cn(
-                      "p-4 transition-all border-slate-800 bg-slate-900/50 backdrop-blur",
-                      participant.is_speaking && "ring-2 ring-green-500",
-                    )}
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className="relative">
-                        <Avatar className="h-12 w-12">
-                          <AvatarFallback className="bg-gradient-to-br from-indigo-500 to-purple-600 text-white">
-                            {participant.profiles.display_name.charAt(0).toUpperCase()}
-                          </AvatarFallback>
-                        </Avatar>
-                        {participant.is_speaking && (
-                          <div className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full bg-green-500">
-                            <Volume2 className="h-3 w-3 text-white" />
+              {/* Participants Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {participants.map((participant) => {
+                  const isSpeaking = speakingUsers.has(participant.user_id)
+                  const isCurrentUser = participant.user_id === currentUser?.id
+                  const audioLevel = audioLevels[participant.user_id] || 0
+                  
+                  return (
+                    <div
+                      key={participant.user_id}
+                      className={cn(
+                        "group relative overflow-hidden rounded-xl border transition-all duration-300",
+                        "hover:scale-[1.02] hover:shadow-lg",
+                        isSpeaking 
+                          ? "border-green-500/50 bg-gradient-to-br from-green-600/10 to-cyan-600/10 shadow-lg shadow-green-500/20 hover:shadow-green-500/30" 
+                          : "border-slate-700/50 bg-slate-800/50 hover:border-slate-600/50 hover:shadow-slate-500/20",
+                        isCurrentUser && "ring-2 ring-cyan-500/50 hover:ring-cyan-400/60"
+                      )}
+                    >
+                      {/* Animated speaking indicator */}
+                      {isSpeaking && (
+                        <div className="absolute inset-0 bg-gradient-to-r from-green-500/10 to-cyan-500/10 animate-pulse" />
+                      )}
+                      
+                      <div className="relative p-4">
+                        <div className="flex items-center gap-3 mb-3">
+                          <div className="relative">
+                            <Avatar className={cn(
+                              "h-12 w-12 transition-all duration-300",
+                              "group-hover:scale-110",
+                              isSpeaking ? "ring-2 ring-green-500 shadow-lg shadow-green-500/25" : "ring-2 ring-slate-700"
+                            )}>
+                              <AvatarFallback className={cn(
+                                "font-semibold transition-all duration-300",
+                                isSpeaking 
+                                  ? "bg-gradient-to-br from-green-500 to-cyan-500 text-white" 
+                                  : "bg-gradient-to-br from-slate-600 to-slate-500 text-slate-200"
+                              )}>
+                                {participant.profiles.display_name.charAt(0).toUpperCase()}
+                              </AvatarFallback>
+                            </Avatar>
+                            {/* Speaking pulse indicator */}
+                            {isSpeaking && (
+                              <div className="absolute -inset-1 rounded-full bg-green-500/20 animate-ping" />
+                            )}
                           </div>
-                        )}
-                      </div>
-                      <div className="flex-1 overflow-hidden">
-                        <div className="truncate font-medium text-white">
-                          {participant.profiles.display_name}
-                          {participant.user_id === currentUser.id && (
-                            <span className="ml-1 text-xs text-slate-400">(você)</span>
-                          )}
+                          <div className="flex-1 min-w-0">
+                            <div className={cn(
+                              "font-medium truncate transition-all duration-300",
+                              "group-hover:translate-x-1",
+                              isSpeaking ? "text-white" : "text-slate-200 group-hover:text-white"
+                            )}>
+                              {participant.profiles.display_name}
+                              {isCurrentUser && (
+                                <span className="ml-2 text-xs text-cyan-400 animate-pulse">(You)</span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-2 mt-1">
+                              <div className={cn(
+                                "text-xs transition-colors duration-300",
+                                isSpeaking ? "text-green-400" : "text-slate-400 group-hover:text-slate-300"
+                              )}>
+                                {isSpeaking ? "Speaking" : "Connected"}
+                              </div>
+                              {!isCurrentUser && (
+                                <div className="flex items-center gap-1">
+                                  <Volume2 className={cn(
+                                    "h-3 w-3 text-slate-400",
+                                    isSpeaking ? "text-green-400" : "text-slate-400 group-hover:text-slate-300"
+                                  )} />
+                                  <span className={cn(
+                                    "text-xs transition-colors duration-300",
+                                    isSpeaking ? "text-green-400" : "text-slate-400 group-hover:text-slate-300"
+                                  )}>
+                                    {Math.round(audioLevel)}%
+                                  </span>
+                                </div>
+                              )}
+                            </div>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-1">
-                          {participant.is_muted && <MicOff className="h-3 w-3 text-red-400" />}
-                          {participant.is_deafened && <VolumeX className="h-3 w-3 text-red-400" />}
-                          {!participant.is_muted && !participant.is_deafened && (
-                            <span className="text-xs text-green-400">Online</span>
-                          )}
+
+                        {/* Audio Level Visualizer */}
+                        <div className="space-y-2">
+                          <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                            <div 
+                              className={cn(
+                                "h-full transition-all duration-100 rounded-full",
+                                isSpeaking 
+                                  ? "bg-gradient-to-r from-green-500 to-cyan-400 shadow-sm shadow-green-500/50" 
+                                  : "bg-gradient-to-r from-slate-600 to-slate-500"
+                              )}
+                              style={{ width: `${audioLevel}%` }}
+                            />
+                          </div>
+                          
+                          {/* Audio bars visualizer */}
+                          <div className="flex items-end justify-center gap-1 h-8">
+                            {Array.from({ length: 5 }).map((_, i) => (
+                              <div
+                                key={i}
+                                className={cn(
+                                  "w-1 rounded-full transition-all duration-100",
+                                  isSpeaking && audioLevel > (i * 20)
+                                    ? "bg-gradient-to-t from-green-500 to-cyan-400 shadow-sm shadow-green-500/50 animate-pulse"
+                                    : "bg-slate-600 group-hover:bg-slate-500"
+                                )}
+                                style={{
+                                  height: isSpeaking && audioLevel > (i * 20) 
+                                    ? `${Math.max(20, (audioLevel / 100) * 32)}px`
+                                    : "4px"
+                                }}
+                              />
+                            ))}
+                          </div>
                         </div>
                       </div>
                     </div>
-                  </Card>
-                ))}
+                  )
+                })}
+
+                {/* Empty state for no participants */}
+                {participants.length === 0 && (
+                  <div className="col-span-full flex flex-col items-center justify-center py-12 text-center">
+                    <div className="rounded-full bg-slate-800 p-6 mb-4">
+                      <Users className="h-12 w-12 text-slate-400" />
+                    </div>
+                    <h3 className="text-lg font-semibold text-slate-300 mb-2">No players in this room</h3>
+                    <p className="text-slate-500 max-w-md">
+                      Be the first to join this voice room and start the conversation!
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+          ) : (
+            /* Welcome Screen */
+            <div className="flex h-full items-center justify-center">
+              <div className="text-center max-w-md">
+                <div className="mb-6">
+                  <div className="mx-auto mb-4 flex h-20 w-20 items-center justify-center rounded-full bg-gradient-to-r from-cyan-500 to-purple-500 shadow-lg shadow-cyan-500/25">
+                    <Gamepad2 className="h-10 w-10 text-white" />
+                  </div>
+                  <h2 className="text-2xl font-bold text-white mb-2">Welcome to Vibecord</h2>
+                  <p className="text-slate-400">
+                    Select a room from the sidebar to start your gaming voice chat experience
+                  </p>
+                </div>
+                
+                <div className="space-y-3 text-sm text-slate-500">
+                  <div className="flex items-center gap-2 justify-center">
+                    <Mic className="h-4 w-4 text-cyan-400" />
+                    <span>Crystal clear voice communication</span>
+                  </div>
+                  <div className="flex items-center gap-2 justify-center">
+                    <Users className="h-4 w-4 text-purple-400" />
+                    <span>Real-time participant tracking</span>
+                  </div>
+                  <div className="flex items-center gap-2 justify-center">
+                    <Zap className="h-4 w-4 text-yellow-400" />
+                    <span>Low latency gaming optimized</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
